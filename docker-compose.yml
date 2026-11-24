@@ -1,8 +1,8 @@
 services:
-  tls-rotation-planner:
+  tls-chain-picker:
     build: .
-    image: tls-rotation-planner:latest
-    container_name: tls-rotation-planner
+    image: tls-chain-picker:latest
+    container_name: tls-chain-picker
     ports:
       - "8000:8000"
     environment:

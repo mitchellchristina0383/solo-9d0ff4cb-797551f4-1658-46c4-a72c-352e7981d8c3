@@ -1,9 +1,9 @@
-"""证书链 / 根证书包解析与核验工具。
+"""证书解析与核验工具。
 
 核验基于系统 openssl 命令（``openssl verify``），同时完成：
-  1. 证书链签名与有效期核验；
+  1. 链签名、基本约束与有效期核验（核验时刻为当前系统时间）；
   2. 以终端根证书包作为唯一信任锚（``-no-CAfile``，不加载系统默认 CA）；
-  3. 按域名做 SAN/CN 主机名校验（``-verify_hostname``）。
+  3. 按服务域名做 SAN/CN 主机名校验（``-verify_hostname``）。
 
 所有 PEM 数据均视为不可信外部输入，只通过临时文件传给 openssl 子进程。
 """
@@ -17,7 +17,7 @@ import tempfile
 from dataclasses import dataclass
 
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.x509.oid import NameOID
 
 _PEM_RE = re.compile(
@@ -46,6 +46,28 @@ def extract_certs(pem_text: str) -> list[x509.Certificate]:
     return certs
 
 
+def cert_der(cert: x509.Certificate) -> bytes:
+    return cert.public_bytes(serialization.Encoding.DER)
+
+
+def cert_pem(cert: x509.Certificate) -> str:
+    return cert.public_bytes(serialization.Encoding.PEM).decode("ascii").strip()
+
+
+def der_size(cert: x509.Certificate) -> int:
+    """证书的 DER 编码字节数（部署字节上限按此统计）。"""
+    return len(cert_der(cert))
+
+
+def cert_fingerprint(cert: x509.Certificate) -> str:
+    return cert.fingerprint(hashes.SHA256()).hex()
+
+
+def name_der(name: x509.Name) -> bytes:
+    """主题/颁发者 Name 的 DER 编码，用于签发关系的精确字节级比较。"""
+    return name.public_bytes()
+
+
 def cert_subject(cert: x509.Certificate) -> str:
     try:
         return cert.subject.rfc4514_string()
@@ -60,81 +82,60 @@ def cert_issuer(cert: x509.Certificate) -> str:
         return "<未知颁发者>"
 
 
-def cert_serials(certs: list[x509.Certificate]) -> list[str]:
-    """用序列号指纹标识证书，用于界面区分新旧材料。"""
-    return [f"{c.serial_number:X}"[:16] for c in certs]
+def _extension_oid_value(cert: x509.Certificate, oid):
+    try:
+        return cert.extensions.get_extension_for_oid(oid).value
+    except x509.ExtensionNotFound:
+        return None
 
 
-def leaf_summary(pem_text: str) -> dict:
-    """提取证书链中叶子证书的概要信息供页面展示。"""
-    certs = extract_certs(pem_text)
-    leaf = certs[0]
+def cert_summary(cert: x509.Certificate) -> dict:
+    """单张证书的概要，供页面粘贴后即时确认。"""
     cn = ""
     try:
-        attrs = leaf.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+        attrs = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
         if attrs:
             cn = attrs[0].value
     except x509.ExtensionNotFound:
         pass
     sans: list[str] = []
     try:
-        ext = leaf.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        ext = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
         sans = ext.value.get_values_for_type(x509.DNSName)
     except x509.ExtensionNotFound:
         pass
+    ski = _extension_oid_value(cert, x509.oid.ExtensionOID.SUBJECT_KEY_IDENTIFIER)
+    aki = _extension_oid_value(cert, x509.oid.ExtensionOID.AUTHORITY_KEY_IDENTIFIER)
+    bc = _extension_oid_value(cert, x509.oid.ExtensionOID.BASIC_CONSTRAINTS)
     return {
-        "subject": cert_subject(leaf),
+        "subject": cert_subject(cert),
         "common_name": cn,
+        "issuer": cert_issuer(cert),
+        "serial": f"{cert.serial_number:X}",
         "sans": sans,
-        "issuer": cert_issuer(leaf),
-        "serial": f"{leaf.serial_number:X}",
-        "not_valid_before": leaf.not_valid_before_utc.strftime("%Y-%m-%d %H:%M UTC"),
-        "not_valid_after": leaf.not_valid_after_utc.strftime("%Y-%m-%d %H:%M UTC"),
-        "chain_length": len(certs),
-        "all_serials": cert_serials(certs),
+        "is_ca": bool(bc and bc.ca),
+        "ski": ski.digest.hex() if ski is not None else "",
+        "aki": aki.key_identifier.hex() if aki is not None and aki.key_identifier else "",
+        "der_bytes": der_size(cert),
+        "not_valid_before": cert.not_valid_before_utc.strftime("%Y-%m-%d %H:%M UTC"),
+        "not_valid_after": cert.not_valid_after_utc.strftime("%Y-%m-%d %H:%M UTC"),
     }
 
 
 def bundle_summary(pem_text: str) -> dict:
-    """提取根证书包概要（包内每个证书的主题/序列号）。"""
+    """根证书包概要（包内每个证书的主题/序列号/DER 字节）。"""
     certs = extract_certs(pem_text)
     return {
         "count": len(certs),
         "subjects": [cert_subject(c) for c in certs],
-        "serials": cert_serials(certs),
+        "serials": [f"{c.serial_number:X}"[:16] for c in certs],
+        "der_bytes": sum(der_size(c) for c in certs),
     }
 
 
-def pem_normalized(pem_text: str) -> str:
-    """规范化 PEM 文本，便于做并集与去重（按证书 DER 去重）。"""
-    certs = extract_certs(pem_text)
-    seen: set[bytes] = set()
-    out: list[str] = []
-    for cert in certs:
-        der = cert.public_bytes(serialization.Encoding.DER)
-        if der in seen:
-            continue
-        seen.add(der)
-        out.append(
-            cert.public_bytes(serialization.Encoding.PEM).decode("ascii").strip()
-        )
-    return "\n".join(out)
-
-
-def merge_pem_bundles(pem_a: str, pem_b: str) -> str:
-    """两个根证书包取并集（按证书 DER 去重，保持 a 在前 b 在后）。"""
-    merged: list[x509.Certificate] = []
-    seen: set[bytes] = set()
-    for text in (pem_a, pem_b):
-        for cert in extract_certs(text):
-            der = cert.public_bytes(serialization.Encoding.DER)
-            if der not in seen:
-                seen.add(der)
-                merged.append(cert)
-    return "\n".join(
-        c.public_bytes(serialization.Encoding.PEM).decode("ascii").strip()
-        for c in merged
-    )
+def chain_pem(certs: list[x509.Certificate]) -> str:
+    """把证书序列拼成叶子在前、中间 CA 依次在后的 PEM 链。"""
+    return "\n".join(cert_pem(c) for c in certs)
 
 
 @dataclass(frozen=True)
@@ -153,33 +154,25 @@ def _write_pem_tmp(directory: str, name: str, pem_text: str) -> str:
     return path
 
 
-def verify_chain(chain_pem: str, bundle_pem: str, hostname: str) -> VerifyResult:
+def verify_chain(chain_certs: list[x509.Certificate], bundle_pem: str, hostname: str) -> VerifyResult:
     """用终端根证书包按域名核验服务证书链。
 
+    ``chain_certs`` 为叶子在前、中间 CA 依次在后的证书对象列表（允许只有叶子）。
     返回 :class:`VerifyResult`；失败时 ``reason`` 为 openssl 给出的原因摘要。
     信任锚仅来自 ``bundle_pem``（-no-CAfile），系统默认 CA 不参与。
     """
-    # 先在进程内解析，材料非法时给出明确错误而不是 openssl 的模糊报错
-    chain_certs = extract_certs(chain_pem)
+    if not chain_certs:
+        return VerifyResult(False, "证书链为空")
     bundle_certs = extract_certs(bundle_pem)
-    leaf_der = chain_certs[0].public_bytes(serialization.Encoding.DER)
-    if len(chain_certs) < 1 or len(bundle_certs) < 1:
-        return VerifyResult(False, "证书链或根证书包为空")
+    if not bundle_certs:
+        return VerifyResult(False, "根证书包为空")
 
-    with tempfile.TemporaryDirectory(prefix="tlsplan_") as tmp:
-        leaf_path = _write_pem_tmp(tmp, "leaf.pem", chain_pem)
+    with tempfile.TemporaryDirectory(prefix="tlschain_") as tmp:
         bundle_path = _write_pem_tmp(tmp, "bundle.pem", bundle_pem)
+        leaf_path = _write_pem_tmp(tmp, "leaf.pem", cert_pem(chain_certs[0]))
         untrusted_path = None
         if len(chain_certs) > 1:
-            # openssl 要求叶子单独传入，其余链上证书走 -untrusted
-            leaf_only = chain_certs[0].public_bytes(
-                serialization.Encoding.PEM
-            ).decode("ascii")
-            intermediates = "\n".join(
-                c.public_bytes(serialization.Encoding.PEM).decode("ascii")
-                for c in chain_certs[1:]
-            )
-            leaf_path = _write_pem_tmp(tmp, "leaf_only.pem", leaf_only)
+            intermediates = "\n".join(cert_pem(c) for c in chain_certs[1:])
             untrusted_path = _write_pem_tmp(tmp, "untrusted.pem", intermediates)
 
         cmd = [

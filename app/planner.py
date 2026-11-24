@@ -1,440 +1,425 @@
-"""根证书更换顺序求解器。
+"""证书链选配求解器。
 
-状态建模
+问题模型
 ========
-* 每个服务副本有两种链状态: OLD(旧链) / NEW(新链)，一次只更换一个副本；
-* 每批终端有三种根包状态: OLD(旧包) / TRANSITION(新旧并集) / NEW(新包)。
-  OLD→NEW 可直跳，也可经 TRANSITION 过渡；处于 TRANSITION 的批次数不得超过
-  页面设定的“同时过渡批次上限”。
+保留已签发的叶子证书，从至多 8 张候选中间证书中选零张或多张，从叶子开始按
+签发关系（证书的颁发者 Name == 下一张证书的主题 Name）排成一条 PEM 链。
+每批终端只使用自己的根证书包，在同一核验时刻（当前系统时间）按服务域名核验
+这条链；要求**所有批次都验证通过**，并在可行链中取叶子 + 中间证书的 DER
+总字节数最小的一条。
 
-核验约束
+候选中允许出现同一中间 CA（相同主题、相同公钥）由不同上级签发的多张证书，
+它们在图上表现为同一主题节点的多个并行分支，枚举时都会被走到。
+
+搜索方式
 ========
-任何核验时刻（初始态、每一步动作之后），每批终端都必须能用“当前持有的根
-证书包”按域名验证每个副本“当前出示的证书链”。核验委托给
-:mod:`app.certutil` 中的 openssl verify。
+以叶子为起点，在“候选证书”构成的签发关系图上做深度优先枚举：
 
-搜索
-====
-状态空间至多 2^4 × 3^4 = 1296，直接 BFS 求步数最少的可行顺序；无解时区分
-“材料本身无法通过验证（硬无解）”与“过渡名额不足（调大上限即可）”。
+* 下一张候选证书的主题 Name（DER）必须等于当前证书的颁发者 Name（DER）；
+* 同一主题 Name 不允许在链中重复（RFC 5280 合法链不会出现重复主题，也借此
+  切断交叉签发环）；
+* 每个路径前缀（含零张中间证书的“仅叶子”链）都是一条候选链，因为信任锚
+  可能在链的任意深度出现；
+* 候选去重按证书 DER 指纹，路径去重按链上证书指纹元组。
+
+候选链先按 DER 总字节数升序排序，再逐批调用 openssl 核验（结果按
+“链指纹 × 批次”缓存）。第一条全部批次通过的链即全局最小可行链；随后按各批
+部署字节上限判定 fit / too_large；没有任何链通过全部批次时判定无解并给出
+每批的失败原因明细。
 """
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass, field
 
-from .certutil import PemError, merge_pem_bundles, verify_chain
+from cryptography import x509
 
-OLD = 0
-NEW = 1
-TRANSITION = 2
+from .certutil import (
+    PemError,
+    cert_der,
+    cert_fingerprint,
+    cert_issuer,
+    cert_subject,
+    cert_summary,
+    chain_pem,
+    der_size,
+    extract_certs,
+    name_der,
+    verify_chain,
+)
 
-STATE_LABEL = {OLD: "旧", TRANSITION: "过渡(并集)", NEW: "新"}
-BUNDLE_MODE_LABEL = {OLD: "旧根包", NEW: "新根包", TRANSITION: "并集根包"}
-CHAIN_LABEL = {OLD: "旧证书链", NEW: "新证书链"}
+MAX_CANDIDATES = 8
+MAX_BATCHES = 4
+# 枚举路径数的安全上限：8 张候选的真实拓扑远达不到，仅用于防御恶意构造
+MAX_ENUMERATED_PATHS = 10000
 
 
 @dataclass
-class Replica:
-    name: str
-    domain: str
-    chains: dict[int, str]  # OLD / NEW 两份 PEM 链
+class Candidate:
+    cert: x509.Certificate
+    der_bytes: int
+    fingerprint: str
+    subject_der: bytes
+    issuer_der: bytes
+    slot: int  # 来源录入槽位（1 起），便于页面提示
+
+    @property
+    def subject(self) -> str:
+        return cert_subject(self.cert)
+
+    @property
+    def issuer(self) -> str:
+        return cert_issuer(self.cert)
 
 
 @dataclass
 class Batch:
     name: str
-    bundles: dict[int, str]  # OLD / NEW / TRANSITION(并集) 三份 PEM 包
+    bundle_pem: str
+    byte_limit: int
 
 
 @dataclass
-class CellResult:
+class ChainOption:
+    """一条候选链（叶子 + 若干中间证书）及其枚举期元数据。"""
+
+    certs: list[x509.Certificate]
+    fingerprints: tuple[str, ...]
+    total_bytes: int
+    intermediate_count: int
+
+
+@dataclass
+class BatchCheck:
+    batch_index: int
+    batch_name: str
     ok: bool
     reason: str = ""
+    byte_limit: int = 0
+    total_bytes: int = 0
+    fits_limit: bool = False
 
 
 @dataclass
 class SolveResult:
-    status: str  # "plan" | "hard_infeasible" | "insufficient_quota"
-    plan: list[dict] = field(default_factory=list)
-    steps_count: int = 0
-    matrix: list[list[dict]] = field(default_factory=list)
-    initial_violations: list[dict] = field(default_factory=list)
-    target_violations: list[dict] = field(default_factory=list)
-    blocker_pairs: list[dict] = field(default_factory=list)
-    max_transition: int = 0
-    min_required: int | None = None
+    status: str  # "fit" | "too_large" | "infeasible"
     message: str = ""
+    total_bytes: int = 0
+    leaf_bytes: int = 0
+    pem: str = ""
+    chain: list[dict] = field(default_factory=list)
+    checks: list[dict] = field(default_factory=list)
+    # too_large：每个受限批次要求的最小字节
+    required_limits: list[dict] = field(default_factory=list)
+    # infeasible：每批终端在全部候选链上的核验情况
+    infeasibility: list[dict] = field(default_factory=list)
+    enumerated_chains: int = 0
 
 
-class Planner:
+class ChainPlanner:
     def __init__(
         self,
-        replicas: list[Replica],
+        leaf: x509.Certificate,
+        hostname: str,
+        candidates: list[Candidate],
         batches: list[Batch],
-        max_transition: int,
     ):
-        self.replicas = replicas
+        self.leaf = leaf
+        self.hostname = hostname
+        self.candidates = candidates
         self.batches = batches
-        self.n = len(replicas)
-        self.m = len(batches)
-        self.max_transition = max_transition
-        # verify_cache[(replica_idx, chain_state, bundle_mode, batch_idx)]
-        self._cache: dict[tuple[int, int, int, int], CellResult] = {}
+        self.leaf_bytes = der_size(leaf)
+        # 主题 Name(DER) -> 该主题下的全部候选证书（交叉签发 => 多张）
+        self._by_subject: dict[bytes, list[Candidate]] = {}
+        for cand in candidates:
+            self._by_subject.setdefault(cand.subject_der, []).append(cand)
+        # 核验缓存：(链指纹元组, 批次下标, 根包内容) -> VerifyResult
+        # 根包内容入键，避免不同批次/规划器间同链误命中
+        self._verify_cache: dict[tuple, object] = {}
+        self._no_cache = object()
 
     # ------------------------------------------------------------------ #
-    # 核验矩阵
+    # 路径枚举
     # ------------------------------------------------------------------ #
-    def _cell(self, i: int, chain_state: int, j: int, bundle_mode: int) -> CellResult:
-        key = (i, chain_state, bundle_mode, j)
-        cached = self._cache.get(key)
-        if cached is not None:
-            return cached
-        replica = self.replicas[i]
-        bundle = self.batches[j].bundles[bundle_mode]
-        result = verify_chain(replica.chains[chain_state], bundle, replica.domain)
-        cell = CellResult(result.ok, result.reason)
-        self._cache[key] = cell
-        return cell
+    def enumerate_chains(self) -> list[ChainOption]:
+        """枚举全部合法签发路径（含仅叶子链），按 DER 总字节升序返回。"""
+        options: list[ChainOption] = []
+        seen: set[tuple[str, ...]] = set()
 
-    def _state_valid(self, chains: tuple[int, ...], bundles: tuple[int, ...]) -> bool:
-        for i, chain_state in enumerate(chains):
-            for j, bundle_mode in enumerate(bundles):
-                if not self._cell(i, chain_state, j, bundle_mode).ok:
-                    return False
-        return True
-
-    # ------------------------------------------------------------------ #
-    # BFS
-    # ------------------------------------------------------------------ #
-    def _neighbors(
-        self,
-        chains: tuple[int, ...],
-        bundles: tuple[int, ...],
-        limit: int,
-    ) -> list[tuple[tuple[int, ...], tuple[int, ...], dict]]:
-        neighbors: list[tuple[tuple[int, ...], tuple[int, ...], dict]] = []
-        transitioning = sum(1 for b in bundles if b == TRANSITION)
-
-        # 顺序固定，保证方案可复现：先开过渡 → 再换副本链 → 最后收过渡/直跳
-        for j in range(self.m):
-            if bundles[j] == OLD and transitioning < limit:
-                new_bundles = list(bundles)
-                new_bundles[j] = TRANSITION
-                move = {
-                    "kind": "batch_transition",
-                    "batch_index": j,
-                    "text": (
-                        f"终端批次「{self.batches[j].name}」: 旧根包 → 过渡根包"
-                        f"（新旧并集）"
-                    ),
-                }
-                neighbors.append((chains, tuple(new_bundles), move))
-
-        for i in range(self.n):
-            if chains[i] == OLD:
-                new_chains = list(chains)
-                new_chains[i] = NEW
-                move = {
-                    "kind": "replica",
-                    "replica_index": i,
-                    "text": (
-                        f"服务副本「{self.replicas[i].name}」"
-                        f"({self.replicas[i].domain}): 旧证书链 → 新证书链"
-                    ),
-                }
-                neighbors.append((tuple(new_chains), bundles, move))
-
-        for j in range(self.m):
-            if bundles[j] == TRANSITION:
-                new_bundles = list(bundles)
-                new_bundles[j] = NEW
-                move = {
-                    "kind": "batch_finish",
-                    "batch_index": j,
-                    "text": (
-                        f"终端批次「{self.batches[j].name}」: 过渡根包 → 新根包"
-                    ),
-                }
-                neighbors.append((chains, tuple(new_bundles), move))
-            elif bundles[j] == OLD:
-                # 直跳: OLD → NEW（仅当目标态核验通过才可能被走到）
-                new_bundles = list(bundles)
-                new_bundles[j] = NEW
-                move = {
-                    "kind": "batch_direct",
-                    "batch_index": j,
-                    "text": (
-                        f"终端批次「{self.batches[j].name}」: 旧根包 → 新根包"
-                        f"（直接更换）"
-                    ),
-                }
-                neighbors.append((chains, tuple(new_bundles), move))
-        return neighbors
-
-    def _bfs(
-        self, limit: int
-    ) -> list[dict] | None:
-        start_chains = tuple([OLD] * self.n)
-        start_bundles = tuple([OLD] * self.m)
-        target_chains = tuple([NEW] * self.n)
-        target_bundles = tuple([NEW] * self.m)
-
-        if not self._state_valid(start_chains, start_bundles):
-            return []  # 空列表表示初始态即不合法，由上层诊断
-        goal = (target_chains, target_bundles)
-        queue: deque[
-            tuple[tuple[int, ...], tuple[int, ...]]
-        ] = deque([(start_chains, start_bundles)])
-        prev: dict[
-            tuple[tuple[int, ...], tuple[int, ...]],
-            tuple[tuple[int, ...], tuple[int, ...], dict] | None,
-        ] = {(start_chains, start_bundles): None}
-
-        while queue:
-            chains, bundles = queue.popleft()
-            if (chains, bundles) == goal:
-                # 回溯动作序列
-                path: list[dict] = []
-                node = goal
-                while prev[node] is not None:
-                    prev_chains, prev_bundles, move = prev[node]
-                    move = dict(move)
-                    move["chains_after"] = list(node[0])
-                    move["bundles_after"] = list(node[1])
-                    path.append(move)
-                    node = (prev_chains, prev_bundles)
-                path.reverse()
-                return path
-            for next_chains, next_bundles, move in self._neighbors(
-                chains, bundles, limit
-            ):
-                if (next_chains, next_bundles) in prev:
-                    continue
-                if not self._state_valid(next_chains, next_bundles):
-                    continue
-                prev[(next_chains, next_bundles)] = (chains, bundles, move)
-                queue.append((next_chains, next_bundles))
-        return None
-
-    # ------------------------------------------------------------------ #
-    # 诊断
-    # ------------------------------------------------------------------ #
-    def _build_matrix(self) -> list[list[dict]]:
-        """每个 (副本, 批次) 在三种根包 × 两种链下的核验结果。"""
-        matrix: list[list[dict]] = []
-        for i in range(self.n):
-            row: list[dict] = []
-            for j in range(self.m):
-                cells = {}
-                for chain_state in (OLD, NEW):
-                    for bundle_mode in (OLD, TRANSITION, NEW):
-                        cell = self._cell(i, chain_state, j, bundle_mode)
-                        cells[f"{chain_state}-{bundle_mode}"] = {
-                            "ok": cell.ok,
-                            "reason": cell.reason,
-                        }
-                row.append(cells)
-            matrix.append(row)
-        return matrix
-
-    def _violations(self, chain_state: int, bundle_mode: int) -> list[dict]:
-        out: list[dict] = []
-        for i in range(self.n):
-            for j in range(self.m):
-                cell = self._cell(i, chain_state, j, bundle_mode)
-                if not cell.ok:
-                    out.append(
-                        {
-                            "replica_index": i,
-                            "replica_name": self.replicas[i].name,
-                            "domain": self.replicas[i].domain,
-                            "batch_index": j,
-                            "batch_name": self.batches[j].name,
-                            "reason": cell.reason,
-                            "chain_state": chain_state,
-                            "bundle_mode": bundle_mode,
-                        }
-                    )
-        return out
-
-    def solve(self) -> SolveResult:
-        # 1) 现状核验：旧链 + 旧包必须全部通过，否则变更无从谈起
-        initial_violations = self._violations(OLD, OLD)
-        target_violations = self._violations(NEW, NEW)
-        matrix = self._build_matrix()
-
-        result = SolveResult(
-            status="plan",
-            matrix=matrix,
-            initial_violations=initial_violations,
-            target_violations=target_violations,
-            max_transition=self.max_transition,
-        )
-
-        if initial_violations or target_violations:
-            result.status = "hard_infeasible"
-            result.blocker_pairs = self._blocker_pairs()
-            if initial_violations and target_violations:
-                result.message = (
-                    "现状与目标态均存在无法通过的核验，证书材料本身不成立。"
+        def emit(certs: list[x509.Certificate]) -> None:
+            fps = tuple(cert_fingerprint(c) for c in certs)
+            if fps in seen:
+                return
+            seen.add(fps)
+            options.append(
+                ChainOption(
+                    certs=list(certs),
+                    fingerprints=fps,
+                    total_bytes=sum(der_size(c) for c in certs),
+                    intermediate_count=len(certs) - 1,
                 )
-            elif initial_violations:
-                result.message = "现状（旧链 + 旧根包）已无法通过核验，无法开始变更。"
-            else:
-                result.message = (
-                    "目标态（新链 + 新根包）无法通过核验，再怎么安排顺序也无解。"
-                )
-            return result
-
-        # 2) 按页面上限搜索
-        path = self._bfs(self.max_transition)
-        if path is not None:
-            result.plan = self._decorate(path)
-            result.steps_count = len(path)
-            result.message = f"找到可行变更顺序，共 {len(path)} 步。"
-            return result
-
-        # 3) 放开上限到全部批次，判断是硬无解还是名额不足
-        relaxed = self._bfs(self.m)
-        if relaxed is None:
-            result.status = "hard_infeasible"
-            result.blocker_pairs = self._blocker_pairs()
-            result.message = (
-                "即使所有批次同时过渡也无解：存在副本链与任何可用根包都无法"
-                "完成的核验组合，见下方阻塞明细。"
             )
-            return result
 
-        # 4) 名额不足：二分/线性求最小同时过渡名额
-        min_required = self._min_limit()
-        result.status = "insufficient_quota"
-        result.min_required = min_required
-        result.message = (
-            f"过渡名额不足：当前上限为 {self.max_transition}，"
-            f"至少需要 {min_required} 个批次同时处于过渡态才能排通。"
+        def dfs(current: x509.Certificate, path: list[x509.Certificate],
+                used_subjects: set[bytes]) -> None:
+            if len(options) >= MAX_ENUMERATED_PATHS:
+                return
+            # 当前路径本身就是一条候选链（信任锚可能就在此处）
+            emit(path)
+            issuer = name_der(current.issuer)
+            if issuer in used_subjects:
+                return  # 主题重复，切断环
+            for nxt in self._by_subject.get(issuer, []):
+                if len(options) >= MAX_ENUMERATED_PATHS:
+                    return
+                path.append(nxt.cert)
+                used_subjects.add(issuer)
+                dfs(nxt.cert, path, used_subjects)
+                used_subjects.discard(issuer)
+                path.pop()
+
+        dfs(self.leaf, [self.leaf], {name_der(self.leaf.subject)})
+        options.sort(key=lambda o: (o.total_bytes, o.intermediate_count, o.fingerprints))
+        return options
+
+    # ------------------------------------------------------------------ #
+    # 核验
+    # ------------------------------------------------------------------ #
+    def _verify(self, option: ChainOption, batch_idx: int):
+        bundle_pem = self.batches[batch_idx].bundle_pem
+        key = (option.fingerprints, batch_idx, bundle_pem)
+        cached = self._verify_cache.get(key, self._no_cache)
+        if cached is not self._no_cache:
+            return cached
+        result = verify_chain(
+            option.certs, bundle_pem, self.hostname
         )
+        self._verify_cache[key] = result
         return result
 
-    def _min_limit(self) -> int:
-        lo, hi = 1, self.m
-        while lo < hi:
-            mid = (lo + hi) // 2
-            if self._bfs(mid) is not None:
-                hi = mid
-            else:
-                lo = mid + 1
-        return lo
-
-    def _blocker_pairs(self) -> list[dict]:
-        """列出存在失败核验组合的 (副本, 批次) 对及全部失败原因。"""
-        blockers: list[dict] = []
-        for i in range(self.n):
-            for j in range(self.m):
-                failed_cells: list[dict] = []
-                any_ok = False
-                for chain_state in (OLD, NEW):
-                    for bundle_mode in (OLD, TRANSITION, NEW):
-                        cell = self._cell(i, chain_state, j, bundle_mode)
-                        if cell.ok:
-                            any_ok = True
-                        else:
-                            failed_cells.append(
-                                {
-                                    "chain_state": chain_state,
-                                    "bundle_mode": bundle_mode,
-                                    "chain_label": CHAIN_LABEL[chain_state],
-                                    "bundle_label": BUNDLE_MODE_LABEL[bundle_mode],
-                                    "reason": cell.reason,
-                                }
-                            )
-                if failed_cells:
-                    blockers.append(
-                        {
-                            "replica_index": i,
-                            "replica_name": self.replicas[i].name,
-                            "domain": self.replicas[i].domain,
-                            "batch_index": j,
-                            "batch_name": self.batches[j].name,
-                            "any_ok": any_ok,
-                            "failed_cells": failed_cells,
-                        }
-                    )
-        return blockers
-
-    def _decorate(self, path: list[dict]) -> list[dict]:
-        """补充分步的状态快照与本步核验摘要，便于页面展示。"""
-        decorated: list[dict] = []
-        for step_no, move in enumerate(path, start=1):
-            info = dict(move)
-            info["step_no"] = step_no
-            info["chains_label"] = [STATE_LABEL[s] for s in move["chains_after"]]
-            info["bundles_label"] = [STATE_LABEL[s] for s in move["bundles_after"]]
-            # 本步动作后仍逐对核验通过，附上核验计数作为证据
-            checks: list[dict] = []
-            for i, chain_state in enumerate(move["chains_after"]):
-                for j, bundle_mode in enumerate(move["bundles_after"]):
-                    cell = self._cell(i, chain_state, j, bundle_mode)
-                    checks.append({"ok": cell.ok, "reason": cell.reason})
-            info["checks_total"] = len(checks)
-            info["checks_passed"] = sum(1 for c in checks if c["ok"])
-            decorated.append(info)
-        return decorated
-
-
-def build_planner(
-    replica_rows: list[dict],
-    batch_rows: list[dict],
-    max_transition: int,
-) -> Planner:
-    """从页面表单数据构造 :class:`Planner`，并计算并集根包。
-
-    每个 replica_rows 元素: {name, domain, old_chain, new_chain}
-    每个 batch_rows 元素:   {name, old_bundle, new_bundle}
-    """
-    if not (1 <= len(replica_rows) <= 4):
-        raise ValueError("服务副本数量须在 1~4 之间")
-    if not (1 <= len(batch_rows) <= 4):
-        raise ValueError("终端批次数量须在 1~4 之间")
-    if not (0 <= max_transition <= len(batch_rows)):
-        raise ValueError("同时过渡批次上限须在 0 与批次数之间")
-
-    replicas: list[Replica] = []
-    for idx, row in enumerate(replica_rows, start=1):
-        domain = (row.get("domain") or "").strip()
-        if not domain:
-            raise ValueError(f"第 {idx} 个副本缺少域名")
-        try:
-            old_chain = row["old_chain"]
-            new_chain = row["new_chain"]
-            merge_pem_bundles(old_chain, new_chain)  # 仅用于校验两份 PEM 均可解析
-        except PemError as exc:
-            raise PemError(f"第 {idx} 个副本证书链解析失败: {exc}") from exc
-        replicas.append(
-            Replica(
-                name=(row.get("name") or f"副本{idx}").strip() or f"副本{idx}",
-                domain=domain,
-                chains={
-                    OLD: old_chain,
-                    NEW: new_chain,
-                },
+    def solve(self) -> SolveResult:
+        options = self.enumerate_chains()
+        if len(options) >= MAX_ENUMERATED_PATHS:
+            return SolveResult(
+                status="infeasible",
+                message=(
+                    f"候选签发关系过于复杂，枚举路径达到上限 {MAX_ENUMERATED_PATHS}，"
+                    "请减少候选中间证书后重试。"
+                ),
+                enumerated_chains=len(options),
             )
+
+        # 记录每条链在各批上的核验结果，无解诊断时复用
+        per_chain_checks: list[list[BatchCheck]] = []
+        best: ChainOption | None = None
+
+        for option in options:
+            checks: list[BatchCheck] = []
+            all_ok = True
+            for j, batch in enumerate(self.batches):
+                vr = self._verify(option, j)
+                fits = option.total_bytes <= batch.byte_limit
+                checks.append(
+                    BatchCheck(
+                        batch_index=j,
+                        batch_name=batch.name,
+                        ok=vr.ok,
+                        reason=vr.reason,
+                        byte_limit=batch.byte_limit,
+                        total_bytes=option.total_bytes,
+                        fits_limit=fits,
+                    )
+                )
+                if not vr.ok:
+                    all_ok = False
+            per_chain_checks.append(checks)
+            if all_ok:
+                best = option
+                break  # options 已按字节升序，首个全过即全局最小
+
+        if best is None:
+            return self._infeasible(options, per_chain_checks)
+
+        best_idx = next(i for i, o in enumerate(options) if o.fingerprints == best.fingerprints)
+        checks = per_chain_checks[best_idx]
+        chain_meta = [
+            {
+                "position": i,
+                "role": "叶子证书" if i == 0 else f"中间证书 {i}",
+                **cert_summary(cert),
+            }
+            for i, cert in enumerate(best.certs)
+        ]
+        result = SolveResult(
+            status="pending",
+            total_bytes=best.total_bytes,
+            leaf_bytes=self.leaf_bytes,
+            pem=chain_pem(best.certs),
+            chain=chain_meta,
+            checks=[self._check_dict(c) for c in checks],
+            enumerated_chains=len(options),
         )
 
+        tight = [c for c in checks if not c.fits_limit]
+        if tight:
+            result.status = "too_large"
+            result.required_limits = [
+                {
+                    "batch_index": c.batch_index,
+                    "batch_name": c.batch_name,
+                    "byte_limit": c.byte_limit,
+                    "required_bytes": c.total_bytes,
+                    "overflow": c.total_bytes - c.byte_limit,
+                }
+                for c in tight
+            ]
+            detail = "；".join(
+                f"批次「{r['batch_name']}」上限 {r['byte_limit']} 字节，"
+                f"至少需要 {r['required_bytes']} 字节（超 {r['overflow']} 字节）"
+                for r in result.required_limits
+            )
+            result.message = (
+                f"所有批次都能验证通过的最小链为 {best.total_bytes} 字节"
+                f"（叶子 {self.leaf_bytes} + 中间 {best.intermediate_count} 张），"
+                f"但仍超出部署字节上限：{detail}。"
+            )
+        else:
+            result.status = "fit"
+            result.message = (
+                f"找到全部 {len(self.batches)} 批终端均可验证通过的最小证书链："
+                f"{best.total_bytes} 字节（叶子 {self.leaf_bytes} 字节 + "
+                f"{best.intermediate_count} 张中间证书），且均在各批部署字节上限内。"
+            )
+        return result
+
+    # ------------------------------------------------------------------ #
+    # 无解诊断
+    # ------------------------------------------------------------------ #
+    def _infeasible(
+        self,
+        options: list[ChainOption],
+        per_chain_checks: list[list[BatchCheck]],
+    ) -> SolveResult:
+        infeasibility: list[dict] = []
+        for j, batch in enumerate(self.batches):
+            passed = [
+                (options[i].total_bytes, options[i].intermediate_count)
+                for i, checks in enumerate(per_chain_checks)
+                if checks[j].ok
+            ]
+            reasons: dict[str, int] = {}
+            for checks in per_chain_checks:
+                reason = checks[j].reason or "未知原因"
+                reasons[reason] = reasons.get(reason, 0) + 1
+            top_reasons = sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))
+            infeasibility.append(
+                {
+                    "batch_index": j,
+                    "batch_name": batch.name,
+                    "byte_limit": batch.byte_limit,
+                    "chains_verified": len(passed),
+                    "chains_total": len(options),
+                    "reasons": [{"reason": r, "occurrences": n} for r, n in top_reasons],
+                }
+            )
+        message = (
+            f"无解：枚举了 {len(options)} 条由签发关系可达的候选链"
+            "（含仅叶子链），没有任何一条能同时通过全部 "
+            f"{len(self.batches)} 批终端的核验。详见各批失败原因。"
+        )
+        return SolveResult(
+            status="infeasible",
+            message=message,
+            enumerated_chains=len(options),
+            infeasibility=infeasibility,
+        )
+
+    @staticmethod
+    def _check_dict(c: BatchCheck) -> dict:
+        return {
+            "batch_index": c.batch_index,
+            "batch_name": c.batch_name,
+            "ok": c.ok,
+            "reason": c.reason,
+            "byte_limit": c.byte_limit,
+            "total_bytes": c.total_bytes,
+            "fits_limit": c.fits_limit,
+        }
+
+
+# ---------------------------------------------------------------------- #
+# 表单装配与输入校验
+# ---------------------------------------------------------------------- #
+def build_planner(
+    hostname: str,
+    leaf_pem: str,
+    candidate_pems: list[str],
+    batch_rows: list[dict],
+) -> ChainPlanner:
+    """从页面表单数据构造 :class:`ChainPlanner`，并完成全部输入校验。"""
+    hostname = (hostname or "").strip()
+    if not hostname:
+        raise ValueError("服务域名不能为空")
+    if len(hostname) > 253 or any(
+        not part or len(part) > 63 for part in hostname.strip(".").split(".")
+    ):
+        raise ValueError(f"服务域名格式不合法: {hostname}")
+
+    leaf_certs = extract_certs(leaf_pem)
+    if len(leaf_certs) != 1:
+        raise PemError(
+            f"叶子证书栏只能包含 1 张证书，实际解析到 {len(leaf_certs)} 张；"
+            "中间证书请放到候选区。"
+        )
+    leaf = leaf_certs[0]
+
+    if len(candidate_pems) > MAX_CANDIDATES:
+        raise ValueError(f"候选中间证书最多 {MAX_CANDIDATES} 张")
+    candidates: list[Candidate] = []
+    seen_der: set[bytes] = set()
+    for slot, pem in enumerate(candidate_pems, start=1):
+        text = (pem or "").strip()
+        if not text:
+            continue
+        certs = extract_certs(text)
+        if len(certs) != 1:
+            raise PemError(
+                f"候选中间证书第 {slot} 槽只能包含 1 张证书，"
+                f"实际解析到 {len(certs)} 张"
+            )
+        cert = certs[0]
+        raw = cert_der(cert)
+        if raw in seen_der:
+            continue  # 完全相同的证书重复粘贴，静默去重
+        seen_der.add(raw)
+        candidates.append(
+            Candidate(
+                cert=cert,
+                der_bytes=len(raw),
+                fingerprint=cert_fingerprint(cert),
+                subject_der=name_der(cert.subject),
+                issuer_der=name_der(cert.issuer),
+                slot=slot,
+            )
+        )
+    if len(candidates) > MAX_CANDIDATES:
+        raise ValueError(f"去重后候选中间证书仍超过 {MAX_CANDIDATES} 张")
+
+    if not (1 <= len(batch_rows) <= MAX_BATCHES):
+        raise ValueError(f"终端批次须在 1~{MAX_BATCHES} 批之间")
     batches: list[Batch] = []
     for idx, row in enumerate(batch_rows, start=1):
         name = (row.get("name") or f"批次{idx}").strip() or f"批次{idx}"
-        old_b = row["old_bundle"]
-        new_b = row["new_bundle"]
+        bundle_pem = row.get("bundle_pem", "")
+        if not (bundle_pem or "").strip():
+            raise PemError(f"批次「{name}」缺少根证书包 PEM")
+        extract_certs(bundle_pem)  # 校验可解析
         try:
-            union_b = merge_pem_bundles(old_b, new_b)
-        except PemError as exc:
-            raise PemError(f"批次「{name}」根证书包解析失败: {exc}") from exc
-        batches.append(
-            Batch(
-                name=name,
-                bundles={OLD: old_b, NEW: new_b, TRANSITION: union_b},
-            )
-        )
-    return Planner(replicas, batches, max_transition)
+            limit = int(row.get("byte_limit"))
+        except (TypeError, ValueError):
+            raise ValueError(f"批次「{name}」的部署字节上限须为整数")
+        if limit <= 0:
+            raise ValueError(f"批次「{name}」的部署字节上限须为正整数")
+        batches.append(Batch(name=name, bundle_pem=bundle_pem, byte_limit=limit))
+
+    return ChainPlanner(hostname=hostname, leaf=leaf, candidates=candidates, batches=batches)

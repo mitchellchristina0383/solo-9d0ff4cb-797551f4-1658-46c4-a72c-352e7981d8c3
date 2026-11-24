@@ -1,4 +1,4 @@
-"""Flask 入口：录入证书材料、调用求解器、展示变更顺序与诊断。"""
+"""Flask 入口：录入叶子/候选中间证书与终端批次，调用链选配求解器并展示结果。"""
 
 from __future__ import annotations
 
@@ -8,13 +8,8 @@ import pathlib
 
 from flask import Flask, jsonify, render_template, request
 
-from .certutil import PemError, bundle_summary, leaf_summary
-from .planner import (
-    BUNDLE_MODE_LABEL,
-    CHAIN_LABEL,
-    STATE_LABEL,
-    build_planner,
-)
+from .certutil import PemError, bundle_summary, cert_summary, extract_certs
+from .planner import MAX_BATCHES, MAX_CANDIDATES, build_planner
 
 BASE_DIR = pathlib.Path(__file__).resolve().parent.parent
 SAMPLE_PATH = BASE_DIR / "samples" / "sample.json"
@@ -29,13 +24,7 @@ def create_app() -> Flask:
         sample = None
         if SAMPLE_PATH.exists():
             sample = json.loads(SAMPLE_PATH.read_text(encoding="utf-8"))
-        return render_template(
-            "index.html",
-            sample=sample,
-            state_labels=STATE_LABEL,
-            chain_labels=CHAIN_LABEL,
-            bundle_mode_labels=BUNDLE_MODE_LABEL,
-        )
+        return render_template("index.html", sample=sample)
 
     @app.get("/api/sample")
     def get_sample():
@@ -50,95 +39,77 @@ def create_app() -> Flask:
         kind = payload.get("kind")
         pem = payload.get("pem", "")
         try:
-            if kind == "chain":
-                return jsonify({"ok": True, "summary": leaf_summary(pem)})
+            certs = extract_certs(pem)
             if kind == "bundle":
                 return jsonify({"ok": True, "summary": bundle_summary(pem)})
-            return jsonify({"ok": False, "error": "kind 须为 chain 或 bundle"}), 400
+            if kind in ("leaf", "candidate"):
+                if kind == "leaf" and len(certs) != 1:
+                    return jsonify(
+                        {"ok": False, "error": f"叶子栏只能含 1 张证书，实际 {len(certs)} 张"}
+                    ), 200
+                return jsonify(
+                    {"ok": True, "summary": cert_summary(certs[0]), "cert_count": len(certs)}
+                )
+            return jsonify({"ok": False, "error": "kind 须为 leaf、candidate 或 bundle"}), 400
         except PemError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 200
 
-    @app.post("/api/plan")
-    def plan():
+    @app.post("/api/select")
+    def select():
         payload = request.get_json(force=True, silent=True) or {}
-        try:
-            max_transition = int(payload.get("max_transition", 0))
-        except (TypeError, ValueError):
-            return jsonify({"ok": False, "error": "同时过渡批次上限须为整数"}), 400
+        hostname = str(payload.get("hostname", "")).strip()
+        leaf_pem = str(payload.get("leaf_pem", ""))
+        candidate_pems = [
+            str(x) for x in (payload.get("candidate_pems") or []) if str(x).strip()
+        ]
+        raw_batches = payload.get("batches") or []
 
-        try:
-            replica_rows = _collect_rows(
-                payload.get("replicas", []), ("old_chain", "new_chain")
+        if not isinstance(raw_batches, list) or not raw_batches:
+            return jsonify({"ok": False, "error": "至少需要 1 批终端"}), 400
+        if len(raw_batches) > MAX_BATCHES:
+            return jsonify({"ok": False, "error": f"终端批次最多 {MAX_BATCHES} 批"}), 400
+        if len(candidate_pems) > MAX_CANDIDATES:
+            return jsonify(
+                {"ok": False, "error": f"候选中间证书最多 {MAX_CANDIDATES} 张"}
+            ), 400
+
+        batch_rows: list[dict] = []
+        for idx, row in enumerate(raw_batches, start=1):
+            if not isinstance(row, dict):
+                return jsonify({"ok": False, "error": f"第 {idx} 批终端数据格式错误"}), 400
+            batch_rows.append(
+                {
+                    "name": str(row.get("name", "") or f"批次{idx}"),
+                    "bundle_pem": str(row.get("bundle_pem", "")),
+                    "byte_limit": row.get("byte_limit"),
+                }
             )
-            batch_rows = _collect_rows(
-                payload.get("batches", []), ("old_bundle", "new_bundle")
-            )
 
-            if not replica_rows:
-                return jsonify(
-                    {"ok": False, "error": "至少需要 1 个服务副本"}
-                ), 400
-            if not batch_rows:
-                return jsonify(
-                    {"ok": False, "error": "至少需要 1 批终端"}
-                ), 400
-            if len(replica_rows) > 4 or len(batch_rows) > 4:
-                return jsonify(
-                    {"ok": False, "error": "副本与终端批次均最多 4 个"}
-                ), 400
-
-            planner = build_planner(replica_rows, batch_rows, max_transition)
+        try:
+            planner = build_planner(hostname, leaf_pem, candidate_pems, batch_rows)
             result = planner.solve()
         except PemError as exc:
             return jsonify({"ok": False, "error": f"PEM 解析失败: {exc}"}), 400
         except ValueError as exc:
             return jsonify({"ok": False, "error": str(exc)}), 400
+
         return jsonify(
             {
                 "ok": True,
                 "status": result.status,
                 "message": result.message,
-                "steps_count": result.steps_count,
-                "max_transition": result.max_transition,
-                "min_required": result.min_required,
-                "plan": result.plan,
-                "matrix": result.matrix,
-                "initial_violations": result.initial_violations,
-                "target_violations": result.target_violations,
-                "blocker_pairs": result.blocker_pairs,
-                "replica_names": [r.name for r in planner.replicas],
-                "batch_names": [b.name for b in planner.batches],
-                "state_labels": STATE_LABEL,
-                "chain_labels": CHAIN_LABEL,
-                "bundle_mode_labels": BUNDLE_MODE_LABEL,
+                "total_bytes": result.total_bytes,
+                "leaf_bytes": result.leaf_bytes,
+                "pem": result.pem,
+                "chain": result.chain,
+                "checks": result.checks,
+                "required_limits": result.required_limits,
+                "infeasibility": result.infeasibility,
+                "enumerated_chains": result.enumerated_chains,
             }
         )
 
     return app
-
-
-def _collect_rows(rows: list[dict], required_pem_fields: tuple[str, ...]) -> list[dict]:
-    """丢弃完全空白的行，并校验保留行的必填 PEM 字段非空。"""
-    cleaned: list[dict] = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        has_text = any(
-            str(row.get(field, "")).strip() for field in required_pem_fields
-        )
-        has_name_or_domain = bool(
-            str(row.get("domain", "")).strip() or str(row.get("name", "")).strip()
-        )
-        if not has_text and not has_name_or_domain:
-            continue
-        for field in required_pem_fields:
-            if not str(row.get(field, "")).strip():
-                raise PemError(
-                    f"行「{row.get('name') or row.get('domain') or '?'}」"
-                    f"缺少字段 {field}"
-                )
-        cleaned.append({k: str(v) for k, v in row.items() if v is not None})
-    return cleaned
 
 
 app = create_app()

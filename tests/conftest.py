@@ -18,10 +18,3 @@ def sample_data():
     """整套测试共享一份真实生成的 PKI 样例。"""
     generate(SAMPLES)
     return json.loads((SAMPLES / "sample.json").read_text(encoding="utf-8"))
-
-
-@pytest.fixture()
-def rows(sample_data):
-    import copy
-
-    return copy.deepcopy(sample_data)

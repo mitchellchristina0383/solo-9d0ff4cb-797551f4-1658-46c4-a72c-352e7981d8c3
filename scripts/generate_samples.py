@@ -1,18 +1,35 @@
-"""生成可在网页直接试跑的一套 HTTPS 根证书更换样例。
+"""生成可在网页直接试跑的证书链选配样例。
 
-层级（新旧两套完全独立的 PKI）::
+层级（两套根 PKI，含同一中间 CA 的交叉签发与多级/短链分支）::
 
-    old-root CA ── old-intermediate CA ── 各副本旧叶子证书
-    new-root CA ── new-intermediate CA ── 各副本新叶子证书（相同 SAN）
+    root-a (Root A)                    root-b (Root B)
+      |                                   |
+      |-- tier1 CA (A 签发, 同主题同公钥) |-- tier1 CA (B 签发, 交叉签发)
+      |-- tier1 过期版本 (A 签发)          |
+      |-- tier2 CA (root-a 直签, 短链)     |
+      |                                   |
+      +-- tier1(A) -- tier2 CA -----------+   (tier2 同时被 tier1 与 root-a 签发)
+                            |
+                          leaf（SAN = demo.service.internal）
+
+另生成一张与任何签发关系都不匹配的“干扰”候选，演示不可达分支被自动忽略。
+
+终端批次：
+  批次1 根包=root-a+root-b，上限较宽松；
+  批次2 根包=root-a，         上限中等；
+  批次3 根包=root-a+root-b， 上限最紧（默认仍可装下最小链）。
+
+另在 samples/bundles/ 下提供 root-b-only 根包，把任一批次换成它即可演示
+“没有共用链（无解）”。
 
 产物（默认写入 samples/）：
-  roots/        旧/新根 CA 自签名证书
-  intermediates/旧/新中间 CA 证书
-  replicas/     每个副本的旧链、新链（叶子 + 中间，PEM 拼接）
-  bundles/      终端旧根包、新根包、并集过渡包
-  sample.json   页面表单预填数据
+  roots/         root-a / root-b 自签名证书
+  intermediates/ 5 张候选中间证书 PEM
+  leaf/          叶子证书 PEM
+  bundles/       各根包（含单根包、并集包）
+  sample.json    页面表单预填数据
 
-样例只用于本地演示：私钥同样落盘，但全部为本地临时测试用途。
+样例仅用于本地演示：私钥在内存生成，不落盘私钥文件，请勿用于真实环境。
 """
 
 from __future__ import annotations
@@ -27,11 +44,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import NameOID
 
-REPLICA_DOMAINS = [
-    ("svc-a", "svc-a.internal.example"),
-    ("svc-b", "svc-b.internal.example"),
-    ("svc-c", "svc-c.internal.example"),
-]
+DOMAIN = "demo.service.internal"
 
 
 def _key() -> rsa.RSAPrivateKey:
@@ -42,7 +55,7 @@ def _name(cn: str, ou: str) -> x509.Name:
     return x509.Name(
         [
             x509.NameAttribute(NameOID.COUNTRY_NAME, "CN"),
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "TLS Rotation Demo"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "TLS Chain Picker Demo"),
             x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, ou),
             x509.NameAttribute(NameOID.COMMON_NAME, cn),
         ]
@@ -93,23 +106,30 @@ def make_root(cn: str) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
     return cert, key
 
 
-def make_intermediate(
+def make_ca_cert(
     cn: str,
-    root_cert: x509.Certificate,
-    root_key: rsa.RSAPrivateKey,
-) -> tuple[x509.Certificate, rsa.RSAPrivateKey]:
-    key = _key()
+    subject_key: rsa.RSAPrivateKey,
+    issuer_cert: x509.Certificate,
+    issuer_key: rsa.RSAPrivateKey,
+    *,
+    path_length: int | None = 0,
+    not_valid_before: datetime.datetime | None = None,
+    not_valid_after: datetime.datetime | None = None,
+) -> x509.Certificate:
     now = datetime.datetime.now(datetime.timezone.utc)
-    subject = _name(cn, "Intermediate CA")
-    cert = (
+    not_valid_before = not_valid_before or (now - datetime.timedelta(days=1))
+    not_valid_after = not_valid_after or (now + datetime.timedelta(days=1825))
+    return (
         x509.CertificateBuilder()
-        .subject_name(subject)
-        .issuer_name(root_cert.subject)
-        .public_key(key.public_key())
+        .subject_name(_name(cn, "Intermediate CA"))
+        .issuer_name(issuer_cert.subject)
+        .public_key(subject_key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(now - datetime.timedelta(days=1))
-        .not_valid_after(now + datetime.timedelta(days=1825))
-        .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+        .not_valid_before(not_valid_before)
+        .not_valid_after(not_valid_after)
+        .add_extension(
+            x509.BasicConstraints(ca=True, path_length=path_length), critical=True
+        )
         .add_extension(
             x509.KeyUsage(
                 digital_signature=True,
@@ -125,20 +145,19 @@ def make_intermediate(
             critical=True,
         )
         .add_extension(
-            x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
-        )
-        .add_extension(
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(root_key.public_key()),
+            x509.SubjectKeyIdentifier.from_public_key(subject_key.public_key()),
             critical=False,
         )
-        .sign(root_key, hashes.SHA256())
+        .add_extension(
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+            critical=False,
+        )
+        .sign(issuer_key, hashes.SHA256())
     )
-    return cert, key
 
 
 def make_leaf(
-    cn: str,
-    dns_names: list[str],
+    dns_name: str,
     issuer_cert: x509.Certificate,
     issuer_key: rsa.RSAPrivateKey,
 ) -> x509.Certificate:
@@ -146,7 +165,7 @@ def make_leaf(
     now = datetime.datetime.now(datetime.timezone.utc)
     cert = (
         x509.CertificateBuilder()
-        .subject_name(_name(cn, "Service"))
+        .subject_name(_name(dns_name, "Service"))
         .issuer_name(issuer_cert.subject)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
@@ -154,10 +173,7 @@ def make_leaf(
         .not_valid_after(now + datetime.timedelta(days=398))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .add_extension(
-            x509.SubjectAlternativeName(
-                [x509.DNSName(name) for name in dns_names]
-            ),
-            critical=False,
+            x509.SubjectAlternativeName([x509.DNSName(dns_name)]), critical=False
         )
         .add_extension(
             x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False
@@ -179,55 +195,100 @@ def make_leaf(
 
 def generate(out_dir: str | os.PathLike = "samples") -> pathlib.Path:
     out = pathlib.Path(out_dir)
+    now = datetime.datetime.now(datetime.timezone.utc)
 
-    old_root, old_root_key = make_root("Demo Old Root CA")
-    new_root, new_root_key = make_root("Demo New Root CA")
-    old_int, old_int_key = make_intermediate(
-        "Demo Old Intermediate CA", old_root, old_root_key
+    # ---- 两套独立根 PKI ------------------------------------------------
+    root_a, root_a_key = make_root("Demo Root A CA")
+    root_b, root_b_key = make_root("Demo Root B CA")
+
+    # ---- 交叉签发的一级中间 CA（同主题、同公钥，分别由 A/B 根签发） -----
+    # 叶子的真实签发路径经过它，因此两张证书都会进入枚举并由各批根包选择
+    tier1_key = _key()
+    tier1_cn = "Demo Tier1 Cross-Signed CA"
+    tier1_a = make_ca_cert(tier1_cn, tier1_key, root_a, root_a_key, path_length=1)
+    tier1_b = make_ca_cert(tier1_cn, tier1_key, root_b, root_b_key, path_length=1)
+    # 同主题、同公钥的过期版本（仍由 A 根签发）：签名链可建立，
+    # openssl 会在有效期环节以 certificate has expired 淘汰
+    tier1_expired = make_ca_cert(
+        tier1_cn,
+        tier1_key,
+        root_a,
+        root_a_key,
+        path_length=1,
+        not_valid_before=now - datetime.timedelta(days=730),
+        not_valid_after=now - datetime.timedelta(days=365),
     )
-    new_int, new_int_key = make_intermediate(
-        "Demo New Intermediate CA", new_root, new_root_key
+
+    # ---- 二级中间 CA，由 tier1 签发，再由它签发叶子 ---------------------
+    tier2_key = _key()
+    tier2 = make_ca_cert("Demo Tier2 Intermediate CA", tier2_key, tier1_a, tier1_key)
+
+    # ---- 另一条 A 根直连分支：tier2 同时被 root-a 直接签发 --------------
+    # 给出“叶子 + tier2”两证书短链（信任锚为 root-a），字节更小
+    tier2_direct_a = make_ca_cert(
+        "Demo Tier2 Intermediate CA", tier2_key, root_a, root_a_key
     )
 
-    _save(out / "roots" / "old-root.pem", _pem_cert(old_root))
-    _save(out / "roots" / "new-root.pem", _pem_cert(new_root))
-    _save(out / "intermediates" / "old-intermediate.pem", _pem_cert(old_int))
-    _save(out / "intermediates" / "new-intermediate.pem", _pem_cert(new_int))
+    # ---- 无关干扰候选：主题与任何签发关系都不匹配，枚举时不可达 ----------
+    decoy_key = _key()
+    decoy = make_ca_cert("Demo Unrelated Decoy CA", decoy_key, root_a, root_a_key)
 
-    old_bundle = _pem_cert(old_root)
-    new_bundle = _pem_cert(new_root)
-    union_bundle = old_bundle + new_bundle
-    _save(out / "bundles" / "old-bundle.pem", old_bundle)
-    _save(out / "bundles" / "new-bundle.pem", new_bundle)
-    _save(out / "bundles" / "union-bundle.pem", union_bundle)
+    # ---- 叶子：由 tier2 签发 --------------------------------------------
+    leaf = make_leaf(DOMAIN, tier2, tier2_key)
 
-    sample = {"replicas": [], "batches": [], "max_transition": 3}
-    for idx, (label, domain) in enumerate(REPLICA_DOMAINS, start=1):
-        old_leaf = make_leaf(domain, [domain], old_int, old_int_key)
-        new_leaf = make_leaf(domain, [domain], new_int, new_int_key)
-        old_chain = _pem_cert(old_leaf) + _pem_cert(old_int)
-        new_chain = _pem_cert(new_leaf) + _pem_cert(new_int)
-        _save(out / "replicas" / label / "old-chain.pem", old_chain)
-        _save(out / "replicas" / label / "new-chain.pem", new_chain)
-        sample["replicas"].append(
+    # ---- 落盘 -----------------------------------------------------------
+    _save(out / "roots" / "root-a.pem", _pem_cert(root_a))
+    _save(out / "roots" / "root-b.pem", _pem_cert(root_b))
+
+    intermediates = {
+        "tier1-cross-a.pem": tier1_a,
+        "tier1-cross-b.pem": tier1_b,
+        "tier1-expired-a.pem": tier1_expired,
+        "tier2.pem": tier2,
+        "tier2-direct-a.pem": tier2_direct_a,
+        "decoy-unrelated.pem": decoy,
+    }
+    for fname, cert in intermediates.items():
+        _save(out / "intermediates" / fname, _pem_cert(cert))
+
+    _save(out / "leaf" / "leaf.pem", _pem_cert(leaf))
+
+    bundle_a = _pem_cert(root_a)
+    bundle_b = _pem_cert(root_b)
+    bundle_union = bundle_a + bundle_b
+    _save(out / "bundles" / "root-a-bundle.pem", bundle_a)
+    _save(out / "bundles" / "root-b-bundle.pem", bundle_b)
+    _save(out / "bundles" / "union-bundle.pem", bundle_union)
+
+    sample = {
+        "hostname": DOMAIN,
+        "leaf_pem": _pem_cert(leaf),
+        "candidate_pems": [
+            _pem_cert(tier2),
+            _pem_cert(tier2_direct_a),
+            _pem_cert(tier1_a),
+            _pem_cert(tier1_b),
+            _pem_cert(tier1_expired),
+            _pem_cert(decoy),
+        ],
+        "batches": [
             {
-                "name": label,
-                "domain": domain,
-                "old_chain": old_chain,
-                "new_chain": new_chain,
-            }
-        )
-
-    # 3 批终端共享同样的旧包/新包，但页面允许各批粘贴不同内容
-    for idx in range(1, 4):
-        sample["batches"].append(
+                "name": "批次1-双根宽松",
+                "bundle_pem": bundle_union,
+                "byte_limit": 8192,
+            },
             {
-                "name": f"终端批次{idx}",
-                "old_bundle": old_bundle,
-                "new_bundle": new_bundle,
-            }
-        )
-
+                "name": "批次2-仅根A",
+                "bundle_pem": bundle_a,
+                "byte_limit": 4096,
+            },
+            {
+                "name": "批次3-双根紧限",
+                "bundle_pem": bundle_union,
+                "byte_limit": 4096,
+            },
+        ],
+    }
     meta_path = out / "sample.json"
     meta_path.write_text(json.dumps(sample, ensure_ascii=False, indent=2), "utf-8")
     return meta_path
